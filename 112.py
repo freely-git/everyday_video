@@ -71,12 +71,9 @@ def init_db():
         cursor.execute("PRAGMA table_info(youtube_videos)")
         columns = [col[1] for col in cursor.fetchall()]
         if "browser_source" not in columns:
-            cursor.execute("DROP TABLE youtube_videos")
-            cursor.execute('''CREATE TABLE youtube_videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                title TEXT, url TEXT, visit_time INTEGER, browser_source TEXT,
-                UNIQUE(title, visit_time))''')
-                
+            # Preserve existing history when upgrading an older database.
+            cursor.execute("ALTER TABLE youtube_videos ADD COLUMN browser_source TEXT")
+
         conn.commit()
         conn.close()
     except Exception as e:
@@ -109,11 +106,26 @@ def load_config():
     return default_config
 
 def save_config(config):
+    # Write atomically so an interruption cannot leave settings.json truncated.
+    temp_config = None
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        fd, temp_config = tempfile.mkstemp(
+            prefix=".settings_", suffix=".tmp", dir=get_app_dir()
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_config, CONFIG_FILE)
+        temp_config = None
     except Exception as e:
         print(f"保存配置文件失败: {e}")
+    finally:
+        if temp_config and os.path.exists(temp_config):
+            try:
+                os.remove(temp_config)
+            except OSError:
+                pass
 
 # ==========================================
 # 2. 自定义UI组件
@@ -807,19 +819,30 @@ class DataEntryApp(QWidget):
 
                 if not hist_path or not os.path.exists(hist_path):
                     continue
-                # Extra safety: ensure resolved path stays under expected base
-                hist_path = os.path.normpath(hist_path)
-                if "User Data" in hist_path:
-                    base = os.path.normpath(os.path.join(local_app, r"Google\Chrome\User Data" if "Chrome" in target else r"Microsoft\Edge\User Data"))
-                    if not hist_path.startswith(base):
+                # Resolve and verify the path is inside the expected profile root.
+                hist_path = os.path.abspath(os.path.normpath(hist_path))
+                if target != "内置专属浏览器":
+                    base = os.path.abspath(os.path.normpath(os.path.join(
+                        local_app,
+                        r"Google\\Chrome\\User Data" if "Chrome" in target
+                        else r"Microsoft\\Edge\\User Data"
+                    )))
+                    try:
+                        if os.path.commonpath([base, hist_path]) != base:
+                            print(f"路径越界拒绝: {hist_path}")
+                            continue
+                    except ValueError:
                         print(f"路径越界拒绝: {hist_path}")
                         continue
 
                 temp_path = None
+                conn_browser = None
                 try:
-                    temp_path = os.path.join(tempfile.gettempdir(), f"temp_sync_{int(time.time())}_{os.getpid()}.db")
+                    # mkstemp avoids collisions between simultaneous runs.
+                    fd, temp_path = tempfile.mkstemp(prefix="temp_sync_", suffix=".db")
+                    os.close(fd)
                     shutil.copy2(hist_path, temp_path)
-                    
+
                     conn_browser = sqlite3.connect(f"file:{temp_path}?mode=ro", uri=True)
                     cursor_browser = conn_browser.cursor()
                     cursor_browser.execute(
@@ -843,11 +866,20 @@ class DataEntryApp(QWidget):
                 except Exception as ex:
                     print(f"提取源 {target} 失败: {ex}")
                 finally:
-                    if temp_path and os.path.exists(temp_path):
+                    if conn_browser is not None:
                         try:
-                            os.remove(temp_path)
-                        except OSError:
+                            conn_browser.close()
+                        except sqlite3.Error:
                             pass
+                    if temp_path:
+                        # SQLite may create sidecar files while reading a copied database.
+                        for candidate in (temp_path, temp_path + "-journal",
+                                          temp_path + "-wal", temp_path + "-shm"):
+                            if os.path.exists(candidate):
+                                try:
+                                    os.remove(candidate)
+                                except OSError:
+                                    pass
 
             conn_local.commit()
             conn_local.close()

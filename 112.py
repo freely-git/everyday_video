@@ -21,7 +21,26 @@ try:
     import gspread
     HAS_GSPREAD = True
 except ImportError:
+    gspread = None
     HAS_GSPREAD = False
+
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    HAS_GOOGLE_OAUTH = True
+except ImportError:
+    Credentials = None
+    Request = None
+    InstalledAppFlow = None
+    HAS_GOOGLE_OAUTH = False
+
+# Least-privilege OAuth scope: read and edit Google Sheets only.
+# No broad Google Drive scope is requested.
+GOOGLE_OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+OAUTH_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__)), "token.json")
 
 # ==========================================
 # 0. 专业的路径处理逻辑
@@ -81,7 +100,7 @@ def init_db():
 
 def load_config():
     default_config = {
-        "json_key_file": "credentials.json", 
+        "oauth_client_file": "client_secret.json",
         "sheet_url": "", 
         "sheet_name": "Sheet1", 
         "date_row": "1", 
@@ -97,8 +116,12 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded_config = json.load(f)
+                # Migrate old service-account setting without reusing its key as OAuth credentials.
+                # The OAuth client JSON should be downloaded separately from Google Cloud Console.
+                if "oauth_client_file" not in loaded_config:
+                    loaded_config["oauth_client_file"] = "client_secret.json"
                 for k, v in default_config.items():
-                    if k not in loaded_config: 
+                    if k not in loaded_config:
                         loaded_config[k] = v
                 return loaded_config
         except Exception as e:
@@ -126,6 +149,22 @@ def save_config(config):
                 os.remove(temp_config)
             except OSError:
                 pass
+
+def is_google_sheets_url(url):
+    """Accept only HTTPS Google Sheets URLs before passing them to gspread."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse((url or "").strip())
+        host = (parsed.hostname or "").lower()
+        return (
+            parsed.scheme == "https"
+            and host in {"docs.google.com", "sheets.google.com"}
+            and parsed.path.startswith("/spreadsheets/")
+        )
+    except (TypeError, ValueError):
+        return False
+
 
 # ==========================================
 # 2. 自定义UI组件
@@ -205,7 +244,7 @@ class VideoSelectDialog(QDialog):
     def __init__(self, target_browser_source, existing_text="", parent=None):
         super().__init__(parent)
         self.setWindowTitle("选择已观看的 YouTube 视频")
-        self.resize(580, 550)
+        self.resize(780, 550)
         self.target_browser_source = target_browser_source
         
         self.already_selected = set([t.strip() for t in existing_text.split("┃") if t.strip()])
@@ -406,10 +445,10 @@ class SettingsDialog(QDialog):
 
         api_group = QGroupBox("表格连接设置 (API配置)")
         api_layout = QFormLayout()
-        self.json_file_input = QLineEdit(self.current_config.get("json_key_file", "credentials.json"))
+        self.json_file_input = QLineEdit(self.current_config.get("oauth_client_file", "client_secret.json"))
         self.sheet_url_input = QLineEdit(self.current_config.get("sheet_url", ""))
         self.sheet_name_input = QLineEdit(self.current_config.get("sheet_name", "Sheet1"))
-        api_layout.addRow("JSON密钥文件:", self.json_file_input)
+        api_layout.addRow("OAuth客户端JSON:", self.json_file_input)
         api_layout.addRow("表格链接(URL):", self.sheet_url_input)
         api_layout.addRow("工作表名称:", self.sheet_name_input)
         
@@ -591,7 +630,7 @@ class SettingsDialog(QDialog):
 
     def get_new_config(self):
         new_config = {
-            "json_key_file": self.json_file_input.text().strip(),
+            "oauth_client_file": self.json_file_input.text().strip(),
             "sheet_url": self.sheet_url_input.text().strip(),
             "sheet_name": self.sheet_name_input.text().strip(),
             "date_row": self.date_row_input.text().strip(),
@@ -794,7 +833,8 @@ class DataEntryApp(QWidget):
         try:
             conn_local = sqlite3.connect(DB_FILE)
             cursor_local = conn_local.cursor()
-            cursor_local.execute("DELETE FROM youtube_videos")
+            # Preserve the historical pool used by the video selector. The UNIQUE constraint
+            # prevents duplicate (title, visit_time) rows when a browser is synced again.
 
             local_app = os.environ.get('LOCALAPPDATA', '')
             total_extracted = 0
@@ -1028,6 +1068,63 @@ class DataEntryApp(QWidget):
             
         return False
 
+    def get_oauth_gspread_client(self, oauth_client_file):
+        """Return a gspread client authenticated as the user's Google account.
+
+        First use opens the system browser for consent. Later uses refresh and reuse
+        token.json. The token is user-specific and must not be shared with others.
+        """
+        creds = None
+        if os.path.isfile(OAUTH_TOKEN_FILE):
+            try:
+                creds = Credentials.from_authorized_user_file(
+                    OAUTH_TOKEN_FILE, GOOGLE_OAUTH_SCOPES
+                )
+                # A token previously issued with the broad Drive scope must not be
+                # silently reused. Force a fresh OAuth flow requesting Sheets only.
+                previous_scopes = set(creds.scopes or [])
+                if "https://www.googleapis.com/auth/drive" in previous_scopes:
+                    creds = None
+            except Exception as exc:
+                # Do not silently delete the token; report a clear error instead.
+                raise RuntimeError(
+                    f"读取 OAuth 令牌失败：{exc}。请备份后检查/重新授权 token.json。"
+                ) from exc
+
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                # A revoked/invalid refresh token requires interactive sign-in again.
+                creds = None
+
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                oauth_client_file, GOOGLE_OAUTH_SCOPES
+            )
+            creds = flow.run_local_server(port=0, open_browser=True, prompt="consent")
+
+        # Atomic token save: interruption should not leave a truncated token file.
+        temp_token = None
+        try:
+            fd, temp_token = tempfile.mkstemp(
+                prefix=".token_", suffix=".tmp", dir=os.path.dirname(OAUTH_TOKEN_FILE)
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as token_handle:
+                token_handle.write(creds.to_json())
+                token_handle.flush()
+                os.fsync(token_handle.fileno())
+            os.replace(temp_token, OAUTH_TOKEN_FILE)
+            temp_token = None
+        finally:
+            if temp_token and os.path.exists(temp_token):
+                try:
+                    os.remove(temp_token)
+                except OSError:
+                    pass
+
+        return gspread.authorize(creds)
+
     def process_data(self):
         target_date = self.date_input.text().strip()
         target_name = self.name_input.text().strip()
@@ -1040,22 +1137,26 @@ class DataEntryApp(QWidget):
         if not sheet_url:
             QMessageBox.warning(self, "警告", "请先在【⚙️ 软件设置】中配置表格链接！")
             return
-
-        json_input_path = self.config.get("json_key_file", "credentials.json")
-        if not json_input_path:
-            QMessageBox.warning(self, "警告", "请先在【⚙️ 软件设置】中填写您的 JSON 密钥文件名！")
+        if not is_google_sheets_url(sheet_url):
+            QMessageBox.warning(
+                self, "表格链接无效",
+                "为避免误用非 Google 地址，请填写 HTTPS 的 Google Sheets 链接（docs.google.com/spreadsheets/...）。"
+            )
             return
-            
-        json_file = ""
-        if os.path.isabs(json_input_path):
-            json_file = json_input_path
+
+        oauth_input_path = self.config.get("oauth_client_file", "client_secret.json")
+        if not oauth_input_path:
+            QMessageBox.warning(self, "警告", "请先在【⚙️ 软件设置】中填写 OAuth 客户端 JSON 文件名！")
+            return
+
+        if os.path.isabs(oauth_input_path):
+            oauth_client_file = oauth_input_path
         else:
-            bundled_path = os.path.join(get_bundle_dir(), json_input_path)
-            external_path = os.path.join(get_app_dir(), json_input_path)
-            if os.path.exists(bundled_path): 
-                json_file = bundled_path
-            else: 
-                json_file = external_path
+            oauth_client_file = os.path.join(get_app_dir(), oauth_input_path)
+            if not os.path.exists(oauth_client_file):
+                bundled_path = os.path.join(get_bundle_dir(), oauth_input_path)
+                if os.path.exists(bundled_path):
+                    oauth_client_file = bundled_path
 
         entries_to_write = []
         for i, (topic_label, value_field, note_field, _, _) in enumerate(self.entry_fields):
@@ -1078,12 +1179,20 @@ class DataEntryApp(QWidget):
             QMessageBox.information(self, "提示", "没有填写任何需要写入的数据。")
             return
 
-        if not HAS_GSPREAD:
-            QMessageBox.critical(self, "错误", "缺少核心网络库。\n\n请在 CMD 或终端运行: \npip install gspread")
+        if not HAS_GSPREAD or not HAS_GOOGLE_OAUTH:
+            QMessageBox.critical(
+                self, "缺少授权组件",
+                "缺少 Google OAuth 依赖。请在 CMD 中运行：\n\npip install --upgrade gspread google-auth google-auth-oauthlib"
+            )
             return
 
-        if not json_file or not os.path.exists(json_file):
-            QMessageBox.warning(self, "错误", f"找不到密钥文件：\n{json_input_path}\n\n请确保已将其放入软件所在的文件夹中！")
+        if not oauth_client_file or not os.path.isfile(oauth_client_file):
+            QMessageBox.warning(
+                self, "找不到 OAuth 客户端文件",
+                f"找不到文件：\n{oauth_input_path}\n\n"
+                "请在 Google Cloud Console 创建 OAuth 客户端（桌面应用），下载 JSON，"
+                "放到软件目录并命名为 client_secret.json，或在设置中填写实际路径。"
+            )
             return
 
         self.submit_btn.setText("正在连接表格并寻找坐标...")
@@ -1092,7 +1201,7 @@ class DataEntryApp(QWidget):
         QApplication.processEvents()
 
         try:
-            gc = gspread.service_account(filename=json_file)
+            gc = self.get_oauth_gspread_client(oauth_client_file)
             sh = gc.open_by_url(sheet_url)
             ws = sh.worksheet(self.config.get("sheet_name", "Sheet1"))
             all_data = ws.get_all_values() 
